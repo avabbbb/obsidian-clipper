@@ -49,6 +49,12 @@ function normalizeText(html: string): string {
 // Twitter/X are already handled by defuddle's embedToMarkdown rule, so we skip
 // those here. Supported platforms: Bilibili, Reddit, Instagram, Vimeo, TikTok,
 // Dailymotion, Facebook, plus generic <video> elements and unknown iframes.
+//
+// IMPORTANT: we replace embeds with real DOM elements (<a>, <img>) rather than
+// text strings containing markdown. Turndown's link/image rules turn those
+// elements into proper markdown ([text](href) / ![alt](src)). If we emitted
+// the markdown as a text node instead, Turndown would escape the [, ], (, ),
+// ! characters — so Obsidian would render them as literal text, not links.
 export function convertMediaEmbeds(html: string): string {
 	const parser = new DOMParser();
 	const doc = parser.parseFromString(html, 'text/html');
@@ -71,11 +77,16 @@ export function convertMediaEmbeds(html: string): string {
 			continue;
 		}
 
-		const replacement = iframeToMarkdown(src);
-		if (replacement) {
-			iframe.replaceWith(doc.createTextNode(replacement));
-			modified = true;
-		}
+		const canonical = canonicalVideoUrl(src) || src;
+		// Wrap the replacement in a <p> so Turndown outputs it as its own block,
+		// keeping the embed on its own line in the final markdown.
+		const wrap = doc.createElement('p');
+		const link = doc.createElement('a');
+		link.href = canonical;
+		link.textContent = '▶ ' + getMessage('videoLabel');
+		wrap.appendChild(link);
+		iframe.replaceWith(wrap);
+		modified = true;
 	}
 
 	// --- <video> elements ---
@@ -90,17 +101,24 @@ export function convertMediaEmbeds(html: string): string {
 		// Prefer the poster image as the displayed embed, with the video src as a link
 		const poster = (video.getAttribute('poster') || '').trim();
 
-		if (src || poster) {
-			const parts: string[] = [];
-			if (poster) {
-				parts.push(`![](${poster})`);
-			}
-			if (src) {
-				parts.push(`[▶ ${getMessage('videoLabel')}](${src})`);
-			}
-			video.replaceWith(doc.createTextNode('\n' + parts.join('\n') + '\n'));
-			modified = true;
+		if (!src && !poster) continue;
+
+		const wrap = doc.createElement('p');
+		if (poster) {
+			const img = doc.createElement('img');
+			img.setAttribute('src', poster);
+			img.setAttribute('alt', getMessage('videoLabel'));
+			wrap.appendChild(img);
+			wrap.appendChild(doc.createElement('br'));
 		}
+		if (src) {
+			const link = doc.createElement('a');
+			link.href = src;
+			link.textContent = '▶ ' + getMessage('videoLabel');
+			wrap.appendChild(link);
+		}
+		video.replaceWith(wrap);
+		modified = true;
 	}
 
 	if (!modified) return html;
@@ -117,10 +135,10 @@ export function convertMediaEmbeds(html: string): string {
 	return result;
 }
 
-// Map a known-platform iframe src to an Obsidian-friendly markdown link.
-// Returns '' when no conversion applies (caller leaves the iframe untouched
-// — defuddle will keep the raw HTML, which is still better than dropping it).
-function iframeToMarkdown(src: string): string {
+// Map a known-platform iframe src URL to its canonical share URL (the page the
+// embed is proxying). Returns '' for unrecognised sources — the caller then
+// falls back to using the raw iframe src as the link target.
+function canonicalVideoUrl(src: string): string {
 	try {
 		const url = new URL(src);
 		const host = url.hostname.toLowerCase();
@@ -130,57 +148,52 @@ function iframeToMarkdown(src: string): string {
 		// Bilibili: player.bilibili.com/player.html?bvid=XXX or ?aid=XXX
 		if (host.includes('bilibili.com')) {
 			const bvid = q.get('bvid');
-			if (bvid) return `\n![](https://www.bilibili.com/video/${bvid})\n`;
+			if (bvid) return `https://www.bilibili.com/video/${bvid}`;
 			const aid = q.get('aid');
-			if (aid) return `\n![](https://www.bilibili.com/video/av${aid})\n`;
+			if (aid) return `https://www.bilibili.com/video/av${aid}`;
 			// Some embeds use /video/BVxxx in the path
 			const pathMatch = path.match(/\/video\/(BV[\w]+)/);
-			if (pathMatch) return `\n![](https://www.bilibili.com/video/${pathMatch[1]})\n`;
+			if (pathMatch) return `https://www.bilibili.com/video/${pathMatch[1]}`;
 		}
 
 		// Reddit: embed.reddit.com/r/<sub>/comments/<id>/<slug>/?context=...
 		if (host.includes('reddit.com') || host.includes('redditmedia.com')) {
 			// /r/sub/comments/id/slug/
 			const m = path.match(/\/r\/([^/]+)\/comments\/([a-z0-9]+)\//i);
-			if (m) return `\n![](https://www.reddit.com/r/${m[1]}/comments/${m[2]})\n`;
+			if (m) return `https://www.reddit.com/r/${m[1]}/comments/${m[2]}`;
 			// /comments/<id>/...
 			const m2 = path.match(/\/comments\/([a-z0-9]+)\//i);
-			if (m2) return `\n![](https://www.reddit.com/comments/${m2[1]})\n`;
+			if (m2) return `https://www.reddit.com/comments/${m2[1]}`;
 		}
 
 		// Instagram: instagram.com/p/<id>/embed or /reel/<id>/embed
 		if (host.includes('instagram.com')) {
 			const m = path.match(/\/(p|reel|reels)\/([^/]+)/i);
-			if (m) return `\n![](https://www.instagram.com/${m[1]}/${m[2]})\n`;
+			if (m) return `https://www.instagram.com/${m[1]}/${m[2]}`;
 		}
 
 		// Vimeo: player.vimeo.com/video/<id>
 		if (host.includes('vimeo.com')) {
 			const m = path.match(/\/video\/(\d+)/);
-			if (m) return `\n![](https://vimeo.com/${m[1]})\n`;
+			if (m) return `https://vimeo.com/${m[1]}`;
 		}
 
 		// TikTok: tiktok.com/embed/v2/<id> or player.tiktok.com
 		if (host.includes('tiktok.com')) {
 			const m = path.match(/\/embed\/v?2?\/(\d+)/i);
-			if (m) return `\n![](https://www.tiktok.com/video/${m[1]})\n`;
+			if (m) return `https://www.tiktok.com/video/${m[1]}`;
 		}
 
 		// Dailymotion: dailymotion.com/embed/video/<id>
 		if (host.includes('dailymotion.com')) {
 			const m = path.match(/\/embed\/video\/([^/]+)/);
-			if (m) return `\n![](https://www.dailymotion.com/video/${m[1]})\n`;
+			if (m) return `https://www.dailymotion.com/video/${m[1]}`;
 		}
 
 		// Facebook: facebook.com/plugins/video.php?href=...
 		if (host.includes('facebook.com') || host.includes('fbcdn')) {
 			const href = q.get('href');
-			if (href) return `\n![](${href})\n`;
-		}
-
-		// Generic fallback: link to the iframe src so it's never invisible
-		if (src.startsWith('http')) {
-			return `\n[▶ ${getMessage('videoLabel')}](${src})\n`;
+			if (href) return href;
 		}
 	} catch {
 		// Invalid URL — fall through

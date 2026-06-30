@@ -473,13 +473,14 @@ function setupEventListeners(tabId: number) {
 
 	const pathField = document.getElementById('path-name-field') as HTMLInputElement;
 	if (pathField) {
-		pathField.addEventListener('change', () => {
+		pathField.addEventListener('change', async () => {
 			const value = pathField.value.trim();
-			if (value) {
-				lastSelectedPath = value;
-				setLocalStorage('lastSelectedPath', value);
-				addToPathHistory(value);
-			}
+			if (!value) return;
+			lastSelectedPath = value;
+			// Await both writes so an immediately-following change event (or
+			// clip) can't race and discard the previous history entry.
+			await setLocalStorage('lastSelectedPath', value);
+			await addToPathHistory(value);
 		});
 	}
 
